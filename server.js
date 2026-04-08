@@ -4,7 +4,6 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const Ably = require('ably');
 
 const app = express();
 const server = http.createServer(app);
@@ -31,26 +30,25 @@ mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('MongoDB error:', err));
 
-// Ably
-const ablyClient = new Ably.Rest(process.env.NEXT_PUBLIC_ABLY_API_KEY);
-app.set('ably', ablyClient);
+// Make io globally available for routes
+app.set('io', io);
+app.set('onlineUsers', new Map());
 
 // Routes
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/users', require('./routes/users'));
-app.use('/api/posts', require('./routes/posts'));
-app.use('/api/stories', require('./routes/stories'));
-app.use('/api/reels', require('./routes/reels'));
-app.use('/api/chat', require('./routes/chat'));
+app.use('/api/auth',          require('./routes/auth'));
+app.use('/api/users',         require('./routes/users'));
+app.use('/api/posts',         require('./routes/posts'));
+app.use('/api/stories',       require('./routes/stories'));
+app.use('/api/reels',         require('./routes/reels'));
+app.use('/api/chat',          require('./routes/chat'));
 app.use('/api/notifications', require('./routes/notifications'));
-app.use('/api/search', require('./routes/search'));
-app.use('/api/upload', require('./routes/upload'));
-app.use('/api/ably', require('./routes/ablyToken'));
+app.use('/api/search',        require('./routes/search'));
+app.use('/api/upload',        require('./routes/upload'));
 
-// Socket.IO for real-time
-require('./socket/socketHandler')(io);
+// Socket.IO
+require('./socket/socketHandler')(io, app);
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Peopulse V2 running on port ${PORT}`));
 
 module.exports = { app, io };

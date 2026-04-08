@@ -43,8 +43,12 @@ const conversationSchema = new mongoose.Schema({
   lastActivity: { type: Date, default: Date.now },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   // Group settings
-  onlyAdminsCanMessage: { type: Boolean, default: false },
+  onlyAdminsCanMessage:  { type: Boolean, default: false },
   onlyAdminsCanEditInfo: { type: Boolean, default: false },
+  allowMemberInvite:     { type: Boolean, default: true },
+  approveNewMembers:     { type: Boolean, default: false },
+  messageDisappearAfter: { type: Number, default: 0 },  // hours, 0 = off
+  muteNotifications:     { type: Boolean, default: false },
   joinLink: { type: String, default: '' },
   pinnedMessages: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Message' }],
   // Per-user settings stored separately

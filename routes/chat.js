@@ -1,289 +1,271 @@
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 const { Message, Conversation } = require('../models/Chat');
-const User = require('../models/User');
-const auth = require('../middleware/auth');
+const User    = require('../models/User');
+const auth    = require('../middleware/auth');
 const { v4: uuidv4 } = require('uuid');
 
 // Get or create direct conversation
 router.post('/conversation/direct', auth, async (req, res) => {
   try {
     const { userId } = req.body;
-    let conv = await Conversation.findOne({
-      type: 'direct',
-      participants: { $all: [req.userId, userId] }
-    }).populate('participants', 'username fullName avatar isVerified isOnline lastSeen')
-      .populate('lastMessage');
-
+    let conv = await Conversation.findOne({ type:'direct', participants: { $all: [req.userId, userId] } })
+      .populate('participants', 'username fullName avatar isVerified isOnline lastSeen')
+      .populate({ path: 'lastMessage', populate: { path: 'sender', select: 'username fullName avatar' } });
     if (!conv) {
-      conv = await Conversation.create({
-        type: 'direct',
-        participants: [req.userId, userId]
-      });
+      conv = await Conversation.create({ type: 'direct', participants: [req.userId, userId] });
       await conv.populate('participants', 'username fullName avatar isVerified isOnline lastSeen');
     }
     res.json(conv);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Create group
 router.post('/conversation/group', auth, async (req, res) => {
   try {
     const { name, participants, avatar, description } = req.body;
-    const allParticipants = [...new Set([...participants, req.userId.toString()])];
-
+    const all = [...new Set([...participants, req.userId.toString()])];
     const conv = await Conversation.create({
-      type: 'group',
-      name,
-      participants: allParticipants,
-      admins: [req.userId],
-      createdBy: req.userId,
-      avatar: avatar || '',
-      description: description || '',
-      joinLink: uuidv4(),
+      type: 'group', name, participants: all, admins: [req.userId],
+      createdBy: req.userId, avatar: avatar||'', description: description||'', joinLink: uuidv4(),
     });
-
     await conv.populate('participants', 'username fullName avatar isVerified isOnline');
     await conv.populate('admins', 'username fullName avatar');
     res.status(201).json(conv);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Get all conversations
+// All conversations
 router.get('/conversations', auth, async (req, res) => {
   try {
     const convs = await Conversation.find({
       participants: req.userId,
-      deletedBy: { $not: { $elemMatch: { user: req.userId } } }
-    })
-      .populate('participants', 'username fullName avatar isVerified isOnline lastSeen')
+      'deletedBy.user': { $ne: req.userId }
+    }).populate('participants', 'username fullName avatar isVerified isOnline lastSeen')
       .populate('admins', 'username fullName avatar')
       .populate({ path: 'lastMessage', populate: { path: 'sender', select: 'username fullName avatar' } })
       .sort({ lastActivity: -1 });
 
-    // Filter out blocked users for direct chats
-    const currentUser = await User.findById(req.userId);
+    const me = await User.findById(req.userId);
     const filtered = convs.filter(c => {
       if (c.type === 'direct') {
         const other = c.participants.find(p => p._id.toString() !== req.userId.toString());
-        return !currentUser.blockedUsers.includes(other?._id);
+        return !me.blockedUsers.some(b => b.toString() === other?._id?.toString());
       }
       return true;
     });
 
-    res.json(filtered);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    // Attach unread counts
+    const withCounts = await Promise.all(filtered.map(async (c) => {
+      const unread = await Message.countDocuments({
+        conversation: c._id,
+        'readBy.user': { $ne: req.userId },
+        sender: { $ne: req.userId },
+        deletedForEveryone: false,
+        'deletedFor': { $ne: req.userId }
+      });
+      return { ...c.toObject(), unreadCount: unread };
+    }));
+
+    res.json(withCounts);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Get messages
+// Messages
 router.get('/messages/:conversationId', auth, async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
-    const messages = await Message.find({
+    const { page=1, limit=30 } = req.query;
+    const msgs = await Message.find({
       conversation: req.params.conversationId,
       deletedFor: { $ne: req.userId },
       deletedForEveryone: false
-    })
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit))
+    }).sort({ createdAt: -1 }).skip((page-1)*limit).limit(+limit)
       .populate('sender', 'username fullName avatar isVerified')
-      .populate('replyTo');
-
-    res.json(messages.reverse());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+      .populate({ path: 'replyTo', populate: { path: 'sender', select: 'username fullName avatar' } });
+    res.json(msgs.reverse());
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Send message
 router.post('/messages', auth, async (req, res) => {
   try {
+    const io = req.app.get('io');
     const { conversationId, content, type, media, replyTo } = req.body;
-
     const conv = await Conversation.findById(conversationId);
-    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
-    if (!conv.participants.includes(req.userId)) return res.status(403).json({ error: 'Not a participant' });
-
-    // Check group permission
-    if (conv.type === 'group' && conv.onlyAdminsCanMessage && !conv.admins.includes(req.userId))
+    if (!conv || !conv.participants.includes(req.userId))
+      return res.status(403).json({ error: 'Not a participant' });
+    if (conv.type==='group' && conv.onlyAdminsCanMessage && !conv.admins.includes(req.userId))
       return res.status(403).json({ error: 'Only admins can send messages' });
 
-    const message = await Message.create({
-      conversation: conversationId,
-      sender: req.userId,
-      content: content || '',
-      type: type || 'text',
-      media: media || [],
-      replyTo,
+    const msg = await Message.create({
+      conversation: conversationId, sender: req.userId,
+      content: content||'', type: type||'text', media: media||[], replyTo
     });
+    await msg.populate('sender', 'username fullName avatar isVerified');
+    if (replyTo) await msg.populate({ path: 'replyTo', populate: { path: 'sender', select: 'username fullName avatar' } });
 
-    await message.populate('sender', 'username fullName avatar isVerified');
-    if (replyTo) await message.populate('replyTo');
-
-    conv.lastMessage = message._id;
-    conv.lastActivity = new Date();
+    conv.lastMessage = msg._id; conv.lastActivity = new Date();
     await conv.save();
 
-    res.status(201).json(message);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    // Push to all in room + unread to offline
+    io?.to(conversationId).emit('message:new', msg);
+    conv.participants.forEach(pid => {
+      if (pid.toString() !== req.userId.toString()) {
+        io?.notifyUser(pid.toString(), 'chat:unread:increment', { conversationId });
+      }
+    });
+
+    res.status(201).json(msg);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Edit message (within 5 minutes)
+// Edit message (5 min window)
 router.put('/messages/:id', auth, async (req, res) => {
   try {
+    const io  = req.app.get('io');
     const { content } = req.body;
-    const message = await Message.findById(req.params.id);
-    if (!message) return res.status(404).json({ error: 'Message not found' });
-    if (message.sender.toString() !== req.userId.toString()) return res.status(403).json({ error: 'Not authorized' });
-
-    const fiveMinutes = 5 * 60 * 1000;
-    if (Date.now() - message.createdAt.getTime() > fiveMinutes)
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ error: 'Not found' });
+    if (msg.sender.toString() !== req.userId.toString()) return res.status(403).json({ error: 'Not authorized' });
+    if (Date.now() - msg.createdAt.getTime() > 5*60*1000)
       return res.status(400).json({ error: 'Edit window expired (5 minutes)' });
 
-    message.editHistory.push({ content: message.content, editedAt: new Date() });
-    message.content = content;
-    message.isEdited = true;
-    message.editedAt = new Date();
-    await message.save();
-    res.json(message);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    msg.editHistory.push({ content: msg.content, editedAt: new Date() });
+    msg.content = content; msg.isEdited = true; msg.editedAt = new Date();
+    await msg.save();
+    io?.to(msg.conversation.toString()).emit('message:edited', { conversationId: msg.conversation, message: msg });
+    res.json(msg);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Delete message (for me or for everyone)
+// Delete message
 router.delete('/messages/:id', auth, async (req, res) => {
   try {
+    const io  = req.app.get('io');
     const { deleteForEveryone } = req.body;
-    const message = await Message.findById(req.params.id);
-    if (!message) return res.status(404).json({ error: 'Message not found' });
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ error: 'Not found' });
 
-    if (deleteForEveryone && message.sender.toString() === req.userId.toString()) {
-      message.deletedForEveryone = true;
-      message.content = 'This message was deleted';
-      message.media = [];
+    // Delete media from cloudinary
+    if (deleteForEveryone && msg.sender.toString() === req.userId.toString()) {
+      const cloudinary = req.app.get('cloudinary');
+      if (msg.media?.length) {
+        await Promise.all(msg.media.filter(m => m.publicId).map(m =>
+          cloudinary.uploader.destroy(m.publicId, { resource_type: m.type==='video' ? 'video' : 'image' }).catch(() => {})
+        ));
+      }
+      msg.deletedForEveryone = true; msg.content = ''; msg.media = [];
     } else {
-      if (!message.deletedFor.includes(req.userId))
-        message.deletedFor.push(req.userId);
+      if (!msg.deletedFor.includes(req.userId)) msg.deletedFor.push(req.userId);
     }
-    await message.save();
-    res.json({ message: 'Deleted', deleteForEveryone });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    await msg.save();
+    io?.to(msg.conversation.toString()).emit('message:deleted', {
+      conversationId: msg.conversation, messageId: msg._id, deleteForEveryone
+    });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Bulk delete messages
+// Bulk delete
 router.delete('/messages/bulk/delete', auth, async (req, res) => {
   try {
-    const { messageIds, deleteForEveryone } = req.body;
+    const io = req.app.get('io');
+    const { messageIds, deleteForEveryone, conversationId } = req.body;
     if (deleteForEveryone) {
-      await Message.updateMany(
-        { _id: { $in: messageIds }, sender: req.userId },
-        { deletedForEveryone: true, content: 'This message was deleted', media: [] }
-      );
+      await Message.updateMany({ _id: { $in: messageIds }, sender: req.userId },
+        { deletedForEveryone: true, content: '', media: [] });
     } else {
-      await Message.updateMany(
-        { _id: { $in: messageIds } },
-        { $addToSet: { deletedFor: req.userId } }
-      );
+      await Message.updateMany({ _id: { $in: messageIds } }, { $addToSet: { deletedFor: req.userId } });
     }
-    res.json({ message: 'Bulk deleted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    io?.to(conversationId).emit('messages:bulk:deleted', { messageIds, deleteForEveryone });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Add reaction
+// React to message
 router.post('/messages/:id/react', auth, async (req, res) => {
   try {
+    const io  = req.app.get('io');
     const { emoji } = req.body;
-    const message = await Message.findById(req.params.id);
-    const existing = message.reactions.find(r => r.user.toString() === req.userId.toString());
-
+    const msg = await Message.findById(req.params.id);
+    const existing = msg.reactions.find(r => r.user.toString() === req.userId.toString());
     if (existing) {
-      if (existing.emoji === emoji) message.reactions.pull(existing);
+      if (existing.emoji === emoji) msg.reactions.pull(existing);
       else existing.emoji = emoji;
     } else {
-      message.reactions.push({ user: req.userId, emoji });
+      msg.reactions.push({ user: req.userId, emoji });
     }
-    await message.save();
-    res.json(message.reactions);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    await msg.save();
+    io?.to(msg.conversation.toString()).emit('message:reacted', {
+      conversationId: msg.conversation, messageId: msg._id, reactions: msg.reactions
+    });
+    res.json(msg.reactions);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Update group settings
+// Group settings
 router.put('/conversation/:id/settings', auth, async (req, res) => {
   try {
     const conv = await Conversation.findById(req.params.id);
-    if (!conv.admins.includes(req.userId)) return res.status(403).json({ error: 'Admin only' });
-
-    const { name, description, avatar, onlyAdminsCanMessage, onlyAdminsCanEditInfo } = req.body;
-    Object.assign(conv, { name, description, avatar, onlyAdminsCanMessage, onlyAdminsCanEditInfo });
+    if (!conv.admins.some(a => a.toString() === req.userId.toString()))
+      return res.status(403).json({ error: 'Admin only' });
+    const { name, description, avatar, onlyAdminsCanMessage, onlyAdminsCanEditInfo,
+            allowMemberInvite, messageDisappearAfter, approveNewMembers } = req.body;
+    Object.assign(conv, { name, description, avatar, onlyAdminsCanMessage, onlyAdminsCanEditInfo,
+      allowMemberInvite, messageDisappearAfter, approveNewMembers });
     await conv.save();
+    const io = req.app.get('io');
+    io?.to(conv._id.toString()).emit('group:updated', conv);
     res.json(conv);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Add members to group
+// Add members
 router.post('/conversation/:id/members', auth, async (req, res) => {
   try {
-    const { userIds } = req.body;
     const conv = await Conversation.findById(req.params.id);
-    if (!conv.admins.includes(req.userId)) return res.status(403).json({ error: 'Admin only' });
-
-    const newMembers = userIds.filter(id => !conv.participants.includes(id));
+    if (!conv.admins.some(a => a.toString() === req.userId.toString()))
+      return res.status(403).json({ error: 'Admin only' });
+    const { userIds } = req.body;
+    const newMembers = userIds.filter(id => !conv.participants.some(p => p.toString() === id));
     conv.participants.push(...newMembers);
     await conv.save();
     await conv.populate('participants', 'username fullName avatar isVerified');
+    const io = req.app.get('io');
+    io?.to(conv._id.toString()).emit('group:members:updated', { participants: conv.participants });
     res.json(conv);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Remove member from group
+// Remove member
 router.delete('/conversation/:id/members/:userId', auth, async (req, res) => {
   try {
     const conv = await Conversation.findById(req.params.id);
-    if (!conv.admins.includes(req.userId)) return res.status(403).json({ error: 'Admin only' });
-
+    if (!conv.admins.some(a => a.toString() === req.userId.toString()))
+      return res.status(403).json({ error: 'Admin only' });
     conv.participants.pull(req.params.userId);
     conv.admins.pull(req.params.userId);
     await conv.save();
-    res.json({ message: 'Member removed' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const io = req.app.get('io');
+    io?.to(conv._id.toString()).emit('group:member:removed', { userId: req.params.userId });
+    res.json({ message: 'Removed' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Make/remove admin
+// Toggle admin
 router.post('/conversation/:id/admins/:userId', auth, async (req, res) => {
   try {
-    const { action } = req.body;
     const conv = await Conversation.findById(req.params.id);
-    if (!conv.admins.includes(req.userId)) return res.status(403).json({ error: 'Admin only' });
-
+    if (!conv.admins.some(a => a.toString() === req.userId.toString()))
+      return res.status(403).json({ error: 'Admin only' });
+    const { action } = req.body; // 'add' | 'remove'
     if (action === 'add') conv.admins.push(req.params.userId);
     else conv.admins.pull(req.params.userId);
     await conv.save();
+    const io = req.app.get('io');
+    io?.to(conv._id.toString()).emit('group:admin:changed', { userId: req.params.userId, action });
     res.json({ message: `Admin ${action}ed` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Leave group
@@ -292,45 +274,35 @@ router.post('/conversation/:id/leave', auth, async (req, res) => {
     const conv = await Conversation.findById(req.params.id);
     conv.participants.pull(req.userId);
     conv.admins.pull(req.userId);
-
-    // If no admins left, make first participant admin
-    if (conv.admins.length === 0 && conv.participants.length > 0)
-      conv.admins.push(conv.participants[0]);
-
+    if (conv.admins.length === 0 && conv.participants.length > 0) conv.admins.push(conv.participants[0]);
     await conv.save();
-    res.json({ message: 'Left group' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const io = req.app.get('io');
+    io?.to(conv._id.toString()).emit('group:member:left', { userId: req.userId });
+    res.json({ message: 'Left' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Delete conversation (only for me)
+// Delete conversation (for me)
 router.delete('/conversation/:id', auth, async (req, res) => {
   try {
     const conv = await Conversation.findById(req.params.id);
     if (!conv.deletedBy.some(d => d.user.toString() === req.userId.toString()))
       conv.deletedBy.push({ user: req.userId, deletedAt: new Date() });
     await conv.save();
-    res.json({ message: 'Conversation deleted for you' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ message: 'Deleted for you' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Pin/unpin message
-router.post('/conversation/:id/pin/:messageId', auth, async (req, res) => {
+// Pin message
+router.post('/conversation/:id/pin/:msgId', auth, async (req, res) => {
   try {
     const conv = await Conversation.findById(req.params.id);
-    if (!conv.admins.includes(req.userId) && conv.type === 'group') return res.status(403).json({ error: 'Admin only' });
-
-    const isPinned = conv.pinnedMessages.includes(req.params.messageId);
-    if (isPinned) conv.pinnedMessages.pull(req.params.messageId);
-    else conv.pinnedMessages.push(req.params.messageId);
+    const isPinned = conv.pinnedMessages.includes(req.params.msgId);
+    if (isPinned) conv.pinnedMessages.pull(req.params.msgId);
+    else conv.pinnedMessages.push(req.params.msgId);
     await conv.save();
     res.json({ pinned: !isPinned });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Mark as read
@@ -340,25 +312,8 @@ router.post('/messages/read/:conversationId', auth, async (req, res) => {
       { conversation: req.params.conversationId, 'readBy.user': { $ne: req.userId } },
       { $push: { readBy: { user: req.userId, readAt: new Date() } } }
     );
-    res.json({ message: 'Marked as read' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Generate Ably token for calling
-router.get('/call-token', auth, async (req, res) => {
-  try {
-    const Ably = require('ably');
-    const client = new Ably.Rest(process.env.NEXT_PUBLIC_ABLY_API_KEY);
-    const tokenParams = { clientId: req.userId.toString() };
-    client.auth.createTokenRequest(tokenParams, (err, tokenRequest) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(tokenRequest);
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;
